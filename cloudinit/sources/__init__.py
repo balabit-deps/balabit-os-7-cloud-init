@@ -9,6 +9,7 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import abc
+from collections import namedtuple
 import copy
 import json
 import os
@@ -17,6 +18,8 @@ import six
 from cloudinit.atomic_helper import write_json
 from cloudinit import importer
 from cloudinit import log as logging
+from cloudinit import net
+from cloudinit.event import EventType
 from cloudinit import type_utils
 from cloudinit import user_data as ud
 from cloudinit import util
@@ -41,10 +44,17 @@ INSTANCE_JSON_FILE = 'instance-data.json'
 # Key which can be provide a cloud's official product name to cloud-init
 METADATA_CLOUD_NAME_KEY = 'cloud-name'
 
+UNSET = "_unset"
+
 LOG = logging.getLogger(__name__)
 
 
 class DataSourceNotFoundException(Exception):
+    pass
+
+
+class InvalidMetaDataException(Exception):
+    """Raised when metadata is broken, unavailable or disabled."""
     pass
 
 
@@ -68,6 +78,10 @@ def process_base64_metadata(metadata, key_path=''):
     return md_copy
 
 
+URLParams = namedtuple(
+    'URLParms', ['max_wait_seconds', 'timeout_seconds', 'num_retries'])
+
+
 @six.add_metaclass(abc.ABCMeta)
 class DataSource(object):
 
@@ -80,6 +94,33 @@ class DataSource(object):
 
     # Cached cloud_name as determined by _get_cloud_name
     _cloud_name = None
+
+    # Track the discovered fallback nic for use in configuration generation.
+    _fallback_interface = None
+
+    # read_url_params
+    url_max_wait = -1   # max_wait < 0 means do not wait
+    url_timeout = 10    # timeout for each metadata url read attempt
+    url_retries = 5     # number of times to retry url upon 404
+
+    # The datasource defines a list of supported EventTypes during which
+    # the datasource can react to changes in metadata and regenerate
+    # network configuration on metadata changes.
+    # A datasource which supports writing network config on each system boot
+    # would set update_events = {'network': [EventType.BOOT]}
+
+    # Default: generate network config on new instance id (first boot).
+    update_events = {'network': [EventType.BOOT_NEW_INSTANCE]}
+
+    # N-tuple listing default values for any metadata-related class
+    # attributes cached on an instance by a process_data runs. These attribute
+    # values are reset via clear_cached_attrs during any update_metadata call.
+    cached_attr_defaults = (
+        ('ec2_metadata', UNSET), ('network_json', UNSET),
+        ('metadata', {}), ('userdata', None), ('userdata_raw', None),
+        ('vendordata', None), ('vendordata_raw', None))
+
+    _dirty_cache = False
 
     def __init__(self, sys_cfg, distro, paths, ud_proc=None):
         self.sys_cfg = sys_cfg
@@ -113,11 +154,31 @@ class DataSource(object):
             'region': self.region,
             'availability-zone': self.availability_zone}}
 
+    def clear_cached_attrs(self, attr_defaults=()):
+        """Reset any cached metadata attributes to datasource defaults.
+
+        @param attr_defaults: Optional tuple of (attr, value) pairs to
+           set instead of cached_attr_defaults.
+        """
+        if not self._dirty_cache:
+            return
+        if attr_defaults:
+            attr_values = attr_defaults
+        else:
+            attr_values = self.cached_attr_defaults
+
+        for attribute, value in attr_values:
+            if hasattr(self, attribute):
+                setattr(self, attribute, value)
+        if not attr_defaults:
+            self._dirty_cache = False
+
     def get_data(self):
         """Datasources implement _get_data to setup metadata and userdata_raw.
 
         Minimally, the datasource should return a boolean True on success.
         """
+        self._dirty_cache = True
         return_value = self._get_data()
         json_file = os.path.join(self.paths.run_dir, INSTANCE_JSON_FILE)
         if not return_value:
@@ -128,6 +189,14 @@ class DataSource(object):
                 'meta-data': self.metadata,
                 'user-data': self.get_userdata_raw(),
                 'vendor-data': self.get_vendordata_raw()}}
+        if hasattr(self, 'network_json'):
+            network_json = getattr(self, 'network_json')
+            if network_json != UNSET:
+                instance_data['ds']['network_json'] = network_json
+        if hasattr(self, 'ec2_metadata'):
+            ec2_metadata = getattr(self, 'ec2_metadata')
+            if ec2_metadata != UNSET:
+                instance_data['ds']['ec2_metadata'] = ec2_metadata
         instance_data.update(
             self._get_standardized_metadata())
         try:
@@ -145,9 +214,46 @@ class DataSource(object):
         return return_value
 
     def _get_data(self):
+        """Walk metadata sources, process crawled data and save attributes."""
         raise NotImplementedError(
             'Subclasses of DataSource must implement _get_data which'
             ' sets self.metadata, vendordata_raw and userdata_raw.')
+
+    def get_url_params(self):
+        """Return the Datasource's prefered url_read parameters.
+
+        Subclasses may override url_max_wait, url_timeout, url_retries.
+
+        @return: A URLParams object with max_wait_seconds, timeout_seconds,
+            num_retries.
+        """
+        max_wait = self.url_max_wait
+        try:
+            max_wait = int(self.ds_cfg.get("max_wait", self.url_max_wait))
+        except ValueError:
+            util.logexc(
+                LOG, "Config max_wait '%s' is not an int, using default '%s'",
+                self.ds_cfg.get("max_wait"), max_wait)
+
+        timeout = self.url_timeout
+        try:
+            timeout = max(
+                0, int(self.ds_cfg.get("timeout", self.url_timeout)))
+        except ValueError:
+            timeout = self.url_timeout
+            util.logexc(
+                LOG, "Config timeout '%s' is not an int, using default '%s'",
+                self.ds_cfg.get('timeout'), timeout)
+
+        retries = self.url_retries
+        try:
+            retries = int(self.ds_cfg.get("retries", self.url_retries))
+        except Exception:
+            util.logexc(
+                LOG, "Config retries '%s' is not an int, using default '%s'",
+                self.ds_cfg.get('retries'), retries)
+
+        return URLParams(max_wait, timeout, retries)
 
     def get_userdata(self, apply_filter=False):
         if self.userdata is None:
@@ -160,6 +266,17 @@ class DataSource(object):
         if self.vendordata is None:
             self.vendordata = self.ud_proc.process(self.get_vendordata_raw())
         return self.vendordata
+
+    @property
+    def fallback_interface(self):
+        """Determine the network interface used during local network config."""
+        if self._fallback_interface is None:
+            self._fallback_interface = net.find_fallback_nic()
+            if self._fallback_interface is None:
+                LOG.warning(
+                    "Did not find a fallback interface on %s.",
+                    self.cloud_name)
+        return self._fallback_interface
 
     @property
     def cloud_name(self):
@@ -340,6 +457,41 @@ class DataSource(object):
     def get_package_mirror_info(self):
         return self.distro.get_package_mirror_info(data_source=self)
 
+    def update_metadata(self, source_event_types):
+        """Refresh cached metadata if the datasource supports this event.
+
+        The datasource has a list of update_events which
+        trigger refreshing all cached metadata as well as refreshing the
+        network configuration.
+
+        @param source_event_types: List of EventTypes which may trigger a
+            metadata update.
+
+        @return True if the datasource did successfully update cached metadata
+            due to source_event_type.
+        """
+        supported_events = {}
+        for event in source_event_types:
+            for update_scope, update_events in self.update_events.items():
+                if event in update_events:
+                    if not supported_events.get(update_scope):
+                        supported_events[update_scope] = []
+                    supported_events[update_scope].append(event)
+        for scope, matched_events in supported_events.items():
+            LOG.debug(
+                "Update datasource metadata and %s config due to events: %s",
+                scope, ', '.join(matched_events))
+            # Each datasource has a cached config property which needs clearing
+            # Once cleared that config property will be regenerated from
+            # current metadata.
+            self.clear_cached_attrs((('_%s_config' % scope, UNSET),))
+        if supported_events:
+            self.clear_cached_attrs()
+            result = self.get_data()
+            if result:
+                return True
+        return False
+
     def check_instance_id(self, sys_cfg):
         # quickly (local check only) if self.instance_id is still
         return False
@@ -444,7 +596,7 @@ def find_source(sys_cfg, distro, paths, ds_deps, cfg_list, pkg_list, reporter):
             with myrep:
                 LOG.debug("Seeing if we can get any data from %s", cls)
                 s = cls(sys_cfg, distro, paths)
-                if s.get_data():
+                if s.update_metadata([EventType.BOOT_NEW_INSTANCE]):
                     myrep.message = "found %s data from %s" % (mode, name)
                     return (s, type_utils.obj_name(cls))
         except Exception:
