@@ -3,11 +3,12 @@
 """Tests for cloudinit.util"""
 
 import logging
-from textwrap import dedent
+import platform
 
 import cloudinit.util as util
 
 from cloudinit.tests.helpers import CiTestCase, mock
+from textwrap import dedent
 
 LOG = logging.getLogger(__name__)
 
@@ -15,6 +16,72 @@ MOUNT_INFO = [
     '68 0 8:3 / / ro,relatime shared:1 - btrfs /dev/sda1 ro,attr2,inode64',
     '153 68 254:0 / /home rw,relatime shared:101 - xfs /dev/sda2 rw,attr2'
 ]
+
+OS_RELEASE_SLES = dedent("""\
+    NAME="SLES"\n
+    VERSION="12-SP3"\n
+    VERSION_ID="12.3"\n
+    PRETTY_NAME="SUSE Linux Enterprise Server 12 SP3"\n
+    ID="sles"\nANSI_COLOR="0;32"\n
+    CPE_NAME="cpe:/o:suse:sles:12:sp3"\n
+""")
+
+OS_RELEASE_OPENSUSE = dedent("""\
+NAME="openSUSE Leap"
+VERSION="42.3"
+ID=opensuse
+ID_LIKE="suse"
+VERSION_ID="42.3"
+PRETTY_NAME="openSUSE Leap 42.3"
+ANSI_COLOR="0;32"
+CPE_NAME="cpe:/o:opensuse:leap:42.3"
+BUG_REPORT_URL="https://bugs.opensuse.org"
+HOME_URL="https://www.opensuse.org/"
+""")
+
+OS_RELEASE_CENTOS = dedent("""\
+    NAME="CentOS Linux"
+    VERSION="7 (Core)"
+    ID="centos"
+    ID_LIKE="rhel fedora"
+    VERSION_ID="7"
+    PRETTY_NAME="CentOS Linux 7 (Core)"
+    ANSI_COLOR="0;31"
+    CPE_NAME="cpe:/o:centos:centos:7"
+    HOME_URL="https://www.centos.org/"
+    BUG_REPORT_URL="https://bugs.centos.org/"
+
+    CENTOS_MANTISBT_PROJECT="CentOS-7"
+    CENTOS_MANTISBT_PROJECT_VERSION="7"
+    REDHAT_SUPPORT_PRODUCT="centos"
+    REDHAT_SUPPORT_PRODUCT_VERSION="7"
+""")
+
+OS_RELEASE_DEBIAN = dedent("""\
+    PRETTY_NAME="Debian GNU/Linux 9 (stretch)"
+    NAME="Debian GNU/Linux"
+    VERSION_ID="9"
+    VERSION="9 (stretch)"
+    ID=debian
+    HOME_URL="https://www.debian.org/"
+    SUPPORT_URL="https://www.debian.org/support"
+    BUG_REPORT_URL="https://bugs.debian.org/"
+""")
+
+OS_RELEASE_UBUNTU = dedent("""\
+    NAME="Ubuntu"\n
+    # comment test
+    VERSION="16.04.3 LTS (Xenial Xerus)"\n
+    ID=ubuntu\n
+    ID_LIKE=debian\n
+    PRETTY_NAME="Ubuntu 16.04.3 LTS"\n
+    VERSION_ID="16.04"\n
+    HOME_URL="http://www.ubuntu.com/"\n
+    SUPPORT_URL="http://help.ubuntu.com/"\n
+    BUG_REPORT_URL="http://bugs.launchpad.net/ubuntu/"\n
+    VERSION_CODENAME=xenial\n
+    UBUNTU_CODENAME=xenial\n
+""")
 
 
 class FakeCloud(object):
@@ -260,5 +327,81 @@ class TestUdevadmSettle(CiTestCase):
         m_subp.side_effect = util.ProcessExecutionError("BOOM")
         self.assertRaises(util.ProcessExecutionError, util.udevadm_settle)
 
+
+@mock.patch('os.path.exists')
+class TestGetLinuxDistro(CiTestCase):
+
+    @classmethod
+    def os_release_exists(self, path):
+        """Side effect function"""
+        if path == '/etc/os-release':
+            return 1
+
+    @mock.patch('cloudinit.util.load_file')
+    def test_get_linux_distro_quoted_name(self, m_os_release, m_path_exists):
+        """Verify we get the correct name if the os-release file has
+        the distro name in quotes"""
+        m_os_release.return_value = OS_RELEASE_SLES
+        m_path_exists.side_effect = TestGetLinuxDistro.os_release_exists
+        dist = util.get_linux_distro()
+        self.assertEqual(('sles', '12.3', platform.machine()), dist)
+
+    @mock.patch('cloudinit.util.load_file')
+    def test_get_linux_distro_bare_name(self, m_os_release, m_path_exists):
+        """Verify we get the correct name if the os-release file does not
+        have the distro name in quotes"""
+        m_os_release.return_value = OS_RELEASE_UBUNTU
+        m_path_exists.side_effect = TestGetLinuxDistro.os_release_exists
+        dist = util.get_linux_distro()
+        self.assertEqual(('ubuntu', '16.04', 'xenial'), dist)
+
+    @mock.patch('cloudinit.util.load_file')
+    def test_get_linux_centos(self, m_os_release, m_path_exists):
+        """Verify we get the correct name and release name on CentOS."""
+        m_os_release.return_value = OS_RELEASE_CENTOS
+        m_path_exists.side_effect = TestGetLinuxDistro.os_release_exists
+        dist = util.get_linux_distro()
+        self.assertEqual(('centos', '7', 'Core'), dist)
+
+    @mock.patch('cloudinit.util.load_file')
+    def test_get_linux_debian(self, m_os_release, m_path_exists):
+        """Verify we get the correct name and release name on Debian."""
+        m_os_release.return_value = OS_RELEASE_DEBIAN
+        m_path_exists.side_effect = TestGetLinuxDistro.os_release_exists
+        dist = util.get_linux_distro()
+        self.assertEqual(('debian', '9', 'stretch'), dist)
+
+    @mock.patch('cloudinit.util.load_file')
+    def test_get_linux_opensuse(self, m_os_release, m_path_exists):
+        """Verify we get the correct name and machine arch on OpenSUSE."""
+        m_os_release.return_value = OS_RELEASE_OPENSUSE
+        m_path_exists.side_effect = TestGetLinuxDistro.os_release_exists
+        dist = util.get_linux_distro()
+        self.assertEqual(('opensuse', '42.3', platform.machine()), dist)
+
+    @mock.patch('platform.dist')
+    def test_get_linux_distro_no_data(self, m_platform_dist, m_path_exists):
+        """Verify we get no information if os-release does not exist"""
+        m_platform_dist.return_value = ('', '', '')
+        m_path_exists.return_value = 0
+        dist = util.get_linux_distro()
+        self.assertEqual(('', '', ''), dist)
+
+    @mock.patch('platform.dist')
+    def test_get_linux_distro_no_impl(self, m_platform_dist, m_path_exists):
+        """Verify we get an empty tuple when no information exists and
+        Exceptions are not propagated"""
+        m_platform_dist.side_effect = Exception()
+        m_path_exists.return_value = 0
+        dist = util.get_linux_distro()
+        self.assertEqual(('', '', ''), dist)
+
+    @mock.patch('platform.dist')
+    def test_get_linux_distro_plat_data(self, m_platform_dist, m_path_exists):
+        """Verify we get the correct platform information"""
+        m_platform_dist.return_value = ('foo', '1.1', 'aarch64')
+        m_path_exists.return_value = 0
+        dist = util.get_linux_distro()
+        self.assertEqual(('foo', '1.1', 'aarch64'), dist)
 
 # vi: ts=4 expandtab
