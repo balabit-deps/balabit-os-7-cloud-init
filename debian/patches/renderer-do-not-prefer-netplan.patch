@@ -7,13 +7,14 @@ Forwarded: not-needed
 Last-Update: 2020-06-01
 --- a/config/cloud.cfg.tmpl
 +++ b/config/cloud.cfg.tmpl
-@@ -209,9 +209,7 @@ system_info:
+@@ -216,10 +216,7 @@ system_info:
       groups: [adm, audio, cdrom, dialout, dip, floppy, lxd, netdev, plugdev, sudo, video]
       sudo: ["ALL=(ALL) NOPASSWD:ALL"]
       shell: /bin/bash
 -{# SRU_BLOCKER: do not ship network renderers on Xenial, Bionic or Eoan #}
 -   network:
 -     renderers: ['netplan', 'eni', 'sysconfig']
+-     activators: ['netplan', 'eni', 'network-manager', 'networkd']
 +{# SRU_UPSTREAM_COMMIT: 4fb6fd8a. Do not ship network renderers #}
     # Automatically discover the best ntp_client
     ntp_client: auto
